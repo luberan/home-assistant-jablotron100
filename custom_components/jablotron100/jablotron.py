@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import binascii
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import copy
 import datetime
 from homeassistant import core
@@ -126,6 +126,9 @@ STORAGE_VERSION: Final = 2
 STORAGE_CENTRAL_UNIT_KEY: Final = "central_unit"
 STORAGE_DEVICES_KEY: Final = "devices"
 STORAGE_STATES_KEY: Final = "states"
+
+SECTION_MAP_POSITIONS_PER_PACKET: Final = (STREAM_PACKET_SIZE - 3) * 2
+SECTION_MAP_PROBE_SECONDS: Final = 2.0
 
 DEVICE_IDENTIFICATION_FIELDS: Final = {
 	0x02: DeviceData.MODEL,
@@ -750,6 +753,10 @@ class Jablotron:
 				self._store_devices_data()
 			return
 
+		highest_device_number = max(not_ignored_devices)
+		if highest_device_number > SECTION_MAP_POSITIONS_PER_PACKET:
+			self._probe_device_sections(highest_device_number)
+
 		required_data = {DeviceData.CONNECTION, DeviceData.SIGNAL_STRENGTH, DeviceData.BATTERY, DeviceData.BATTERY_LEVEL, DeviceData.SECTION}
 		if (
 			set(self._devices_data) == {self._get_device_id(number) for number in not_ignored_devices}
@@ -762,7 +769,6 @@ class Jablotron:
 
 		estimated_duration = math.ceil(not_ignored_devices_count / 10) + 1
 		expected_packets_count = not_ignored_devices_count + 1
-		highest_device_number = max(not_ignored_devices)
 		minimum_sections_packet_length = 3 + math.ceil(highest_device_number / 2)
 		device_status_packets: Dict[int, bytes] = {}
 		received_sections_packet_length: int | None = None
@@ -927,6 +933,104 @@ class Jablotron:
 
 		self._devices_data = devices_data
 		self._store_devices_data()
+
+	def _probe_device_sections(self, highest_device_number: int) -> None:
+		# Parameter 2 may be a count or an end position; do not decode these replies.
+		probes = [(1, highest_device_number), (1, 2), (3, 4)]
+		probes.extend(
+			(start, min(SECTION_MAP_POSITIONS_PER_PACKET, highest_device_number - start + 1))
+			for start in range(SECTION_MAP_POSITIONS_PER_PACKET + 1, highest_device_number + 1, SECTION_MAP_POSITIONS_PER_PACKET)
+		)
+		probes.extend(
+			(start, count) for start, count in ((199, 2), (213, 2), (219, 1))
+			if start + count - 1 <= highest_device_number
+		)
+		LOGGER.warning(
+			"Section-map probe v1: diagnostic build, not a fix. Highest requested position: %s."
+			" Capturing %s read-only map requests with %s-second observation windows."
+			" Device cache will not be changed, even if already complete; setup will deliberately remain unavailable.",
+			highest_device_number, len(probes), SECTION_MAP_PROBE_SECONDS,
+		)
+		if self._stream_stop_event.is_set():
+			message = "Section-map probe v1 stopped before capture."
+			LOGGER.warning(message)
+			raise ServiceUnavailable(message)
+
+		stop_event = threading.Event()
+		current_window = 0
+		reply_counts = [0] * (len(probes) + 1)
+
+		def reader_thread() -> None:
+			stream = self._open_read_stream(stop_event)
+			try:
+				while not stop_event.is_set() and not self._stream_stop_event.is_set():
+					raw_packet = stream.read(STREAM_PACKET_SIZE)
+					if raw_packet is None:
+						if not stop_event.is_set() and not self._stream_stop_event.is_set():
+							raise ServiceUnavailable("Serial reader stopped unexpectedly during section-map capture")
+						break
+					if not raw_packet:
+						raise ServiceUnavailable("Serial stream closed during section-map capture")
+
+					for packet in self.get_packets_from_packet(raw_packet):
+						if not self._is_devices_sections_packet(packet):
+							continue
+						window = current_window
+						reply_counts[window] += 1
+						declared_length = self.bytes_to_int(packet[1:2]) + 2 if len(packet) >= 2 else None
+						LOGGER.warning(
+							"Section-map probe v1: reply observed in window %s; packet=%s;"
+							" received_bytes=%s; header_total_bytes=%s; byte_2=%s."
+							" Window timing does not prove which request a reply belongs to.",
+							window, packet.hex(), len(packet), declared_length, packet[2:3].hex(),
+						)
+			finally:
+				stream.close()
+
+		try:
+			with ThreadPoolExecutor(max_workers=1) as executor:
+				reader = executor.submit(reader_thread)
+				try:
+					self._send_packet(self.create_packet_authorisation_code(self._config[CONF_PASSWORD]))
+					for index, (first, second) in enumerate(probes, 1):
+						if self._stream_stop_event.is_set():
+							break
+						if reader.done():
+							reader.result()
+							break
+						current_window = index
+						packet = self.create_packet(PACKET_GET_DEVICES_SECTIONS, self.int_to_bytes(first) + self.int_to_bytes(second))
+						LOGGER.warning(
+							"Section-map probe v1: request window %s/%s; parameters=(%s, %s); packet=%s.",
+							index, len(probes), first, second, packet.hex(),
+						)
+						self._send_packet(packet)
+						done, _ = wait((reader,), timeout=SECTION_MAP_PROBE_SECONDS)
+						if done:
+							reader.result()
+							break
+				finally:
+					stop_event.set()
+			reader.result()
+		except (OSError, ServiceUnavailable) as ex:
+			message = "Section-map probe v1 failed: {}".format(ex)
+			LOGGER.exception("%s", message)
+			raise ServiceUnavailable(message) from ex
+
+		LOGGER.warning(
+			"Section-map probe v1: map reply counts by observation window (0 is before the first request): %s.",
+			dict(enumerate(reply_counts)),
+		)
+		if self._stream_stop_event.is_set():
+			message = "Section-map probe v1 stopped during capture; no device cache was changed."
+		else:
+			message = (
+				"Section-map probe v1 capture finished. This is not a successful discovery."
+				" No section assignments or device cache were changed."
+				" Share the sanitized probe log and restore the regular integration build."
+			)
+		LOGGER.warning(message)
+		raise ServiceUnavailable(message)
 
 	async def _create_devices(self) -> None:
 		for device_number in range(1, self._config[CONF_NUMBER_OF_DEVICES] + 1):

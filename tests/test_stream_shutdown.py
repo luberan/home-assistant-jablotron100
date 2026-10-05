@@ -6,10 +6,12 @@ import sys
 import threading
 from unittest.mock import Mock
 
+from homeassistant.const import CONF_PASSWORD
 import pytest
 
 from custom_components.jablotron100.jablotron import Jablotron
-from custom_components.jablotron100.const import DeviceType
+from custom_components.jablotron100.const import DeviceType, PACKET_GET_DEVICES_SECTIONS
+from custom_components.jablotron100.errors import ServiceUnavailable
 from custom_components.jablotron100.stream import JablotronReadStream
 
 
@@ -100,6 +102,32 @@ def test_local_detection_stop_does_not_stop_running_instance():
 		assert not jablotron._stream_stop_event.is_set()
 	finally:
 		stream.close()
+		os.close(read_fd)
+		os.close(write_fd)
+
+
+def test_section_map_probe_shutdown_stops_idle_reader():
+	read_fd, write_fd = os.pipe()
+	jablotron = object.__new__(Jablotron)
+	jablotron._config = {CONF_PASSWORD: "1234"}
+	jablotron._serial_port = f"/proc/self/fd/{read_fd}"
+	jablotron._stream_stop_event = threading.Event()
+	started = threading.Event()
+	jablotron._send_packet = Mock(
+		side_effect=lambda packet: started.set() if packet[:1] == PACKET_GET_DEVICES_SECTIONS else None,
+	)
+	executor = ThreadPoolExecutor(max_workers=1)
+	probe = executor.submit(jablotron._probe_device_sections, 219)
+	try:
+		assert started.wait(5)
+		jablotron._stream_stop_event.set()
+		with pytest.raises(ServiceUnavailable, match="stopped during capture"):
+			probe.result(timeout=1)
+		assert jablotron._send_packet.call_count == 2
+	finally:
+		jablotron._stream_stop_event.set()
+		os.write(write_fd, b"\x00")
+		executor.shutdown(wait=True)
 		os.close(read_fd)
 		os.close(write_fd)
 

@@ -1,7 +1,7 @@
 {
 	"domain": "jablotron100",
 	"name": "Jablotron 100",
-	"version": "3.34.1",
+	"version": "3.34.1.dev1741",
 	"integration_type": "hub",
 	"config_flow": true,
 	"documentation": "https://github.com/kukulich/home-assistant-jablotron100",
@@ -11,4 +11,3 @@
 	"requirements": [],
 	"iot_class": "local_push"
 }
-

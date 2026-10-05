@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
+from concurrent.futures import wait
+from queue import Empty, Queue
+import threading
+from unittest.mock import Mock, call
 
 from homeassistant.const import CONF_PASSWORD
 import pytest
@@ -12,6 +15,7 @@ from custom_components.jablotron100.const import (
 	DeviceData,
 	DeviceType,
 	PACKET_DEVICES_SECTIONS,
+	PACKET_GET_DEVICES_SECTIONS,
 	SIGNAL_STRENGTH_STEP,
 )
 from custom_components.jablotron100.errors import ServiceUnavailable, ShouldNotHappen
@@ -419,3 +423,242 @@ def test_discovery_preserves_and_collects_identification(discovery, complete):
 	assert DeviceData.FIRMWARE_VERSION not in jablotron._devices_data["device_1"]
 	assert set(jablotron._devices_data) == {"device_1", "device_2"}
 	jablotron._store_devices_data.assert_called_once_with()
+
+
+@pytest.fixture
+def section_map_probe(discovery, monkeypatch):
+	jablotron, stream = discovery
+	jablotron._stream_stop_event = threading.Event()
+	jablotron._get_not_ignored_devices.return_value = [200, 214, 219]
+	jablotron._devices_data = {"device_9": {DeviceData.SECTION: 4}}
+	incoming: Queue[bytes] = Queue()
+	processed = threading.Event()
+
+	def open_stream(stop_event):
+		needs_ack = False
+
+		def read(size):
+			nonlocal needs_ack
+			assert size == 64
+			if needs_ack:
+				processed.set()
+				needs_ack = False
+			while not stop_event.is_set() and not jablotron._stream_stop_event.is_set():
+				try:
+					packet = incoming.get(timeout=0.01)
+				except Empty:
+					continue
+				assert len(packet) <= size
+				needs_ack = True
+				return packet
+			return None
+
+		stream.read.side_effect = read
+		return stream
+
+	def enqueue(packet):
+		processed.clear()
+		incoming.put(packet)
+		assert processed.wait(5), "Probe did not finish processing the queued packet"
+
+	jablotron._open_read_stream.side_effect = open_stream
+	waiter = Mock(side_effect=lambda futures, timeout: wait(futures, timeout=0.01))
+	monkeypatch.setattr("custom_components.jablotron100.jablotron.wait", waiter)
+	return jablotron, stream, enqueue, waiter
+
+
+def test_section_map_probe_records_exact_requests_without_applying_replies(section_map_probe, caplog):
+	jablotron, stream, enqueue, waiter = section_map_probe
+	jablotron._config[CONF_PASSWORD] = "12*4826"
+	previous_data = {"device_9": {DeviceData.SECTION: 4}}
+	expected_requests = [
+		"3a0201db", "3a020102", "3a020304", "3a027b61", "3a02c702", "3a02d502", "3a02db01",
+	]
+	# Only the first map is captured from upstream issue 174; offset replies are synthetic.
+	replies = [
+		bytes.fromhex("3b3e0103000000000000000000002292222222222222222222220001110433333355550050004400000629222202000000007077a0aa00a000aa000000333323"),
+		bytes.fromhex("3b020103"),
+		bytes.fromhex("3b03030000"),
+		Jablotron.create_packet(PACKET_DEVICES_SECTIONS, b"\x7b" + b"\x00" * 49),
+		bytes.fromhex("3b02c700"),
+		bytes.fromhex("3b02d510"),
+		bytes.fromhex("3b02db01"),
+	]
+	reply_iter = iter(replies)
+	authorisation = Jablotron.create_packet_authorisation_code("12*4826")
+	identification = Jablotron.create_packet(b"\x90", b"\x01private-identification")
+
+	def send(packet):
+		if packet[:1] == PACKET_GET_DEVICES_SECTIONS:
+			enqueue(authorisation + identification)
+			enqueue(next(reply_iter))
+
+	jablotron._send_packet.side_effect = send
+	with pytest.raises(ServiceUnavailable, match="capture finished") as error:
+		jablotron._detect_devices()
+
+	assert "not a successful discovery" in str(error.value)
+	assert jablotron._send_packet.call_args_list == [
+		call(authorisation), *(call(bytes.fromhex(packet)) for packet in expected_requests),
+	]
+	assert waiter.call_count == 7
+	assert all(invocation.kwargs["timeout"] == 2.0 for invocation in waiter.call_args_list)
+	for window, (request, reply) in enumerate(zip(expected_requests, replies), 1):
+		assert any(f"request window {window}/7;" in message and f"packet={request}." in message for message in caplog.messages)
+		assert any(f"reply observed in window {window}; packet={reply.hex()};" in message for message in caplog.messages)
+	assert "{0: 0, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1}" in caplog.text
+	assert "12*4826" not in caplog.text
+	assert authorisation.hex() not in caplog.text
+	assert identification.hex() not in caplog.text
+	assert "private-identification" not in caplog.text
+	assert jablotron._devices_data == previous_data
+	jablotron._store_devices_data.assert_not_called()
+	jablotron._send_packets.assert_not_called()
+	jablotron._log_incoming_packet.assert_not_called()
+	stream.close.assert_called_once_with()
+	assert jablotron._open_read_stream.call_args.args[0].is_set()
+	assert not jablotron._stream_stop_event.is_set()
+
+
+@pytest.mark.parametrize("highest,expected_requests", [
+	pytest.param(123, ["3a02017b", "3a020102", "3a020304", "3a027b01"], id="first-position-above-limit"),
+	pytest.param(200, ["3a0201c8", "3a020102", "3a020304", "3a027b4e", "3a02c702"], id="reference-position-200"),
+	pytest.param(214, ["3a0201d6", "3a020102", "3a020304", "3a027b5c", "3a02c702", "3a02d502"], id="reference-position-214"),
+])
+def test_section_map_probe_bounds_requests_and_reports_no_replies(section_map_probe, caplog, highest, expected_requests):
+	jablotron, stream, _, waiter = section_map_probe
+	jablotron._get_not_ignored_devices.return_value = [highest]
+	with pytest.raises(ServiceUnavailable, match="capture finished"):
+		jablotron._detect_devices()
+	requests = [invocation.args[0] for invocation in jablotron._send_packet.call_args_list[1:]]
+	assert requests == [bytes.fromhex(packet) for packet in expected_requests]
+	assert all(1 <= packet[2] <= highest and 1 <= packet[3] <= highest for packet in requests)
+	assert all(packet[2] + packet[3] - 1 <= highest for packet in requests[3:])
+	assert waiter.call_count == len(expected_requests)
+	assert str(dict.fromkeys(range(len(expected_requests) + 1), 0)) in caplog.text
+	assert "not a successful discovery" in caplog.text
+	assert jablotron._devices_data == {"device_9": {DeviceData.SECTION: 4}}
+	jablotron._store_devices_data.assert_not_called()
+	stream.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("packet,declared_length", [
+	pytest.param(b"\x3b", None, id="missing-length-header"),
+	pytest.param(b"\x3b\x00", 2, id="missing-start-byte"),
+	pytest.param(b"\x3b\x05\x7b\x00", 7, id="truncated-map"),
+])
+def test_section_map_probe_records_malformed_maps(section_map_probe, caplog, packet, declared_length):
+	jablotron, stream, enqueue, _ = section_map_probe
+	first_request = bytes.fromhex("3a0201db")
+	jablotron._send_packet.side_effect = lambda outgoing: enqueue(packet) if outgoing == first_request else None
+	with pytest.raises(ServiceUnavailable, match="capture finished"):
+		jablotron._detect_devices()
+	assert f"reply observed in window 1; packet={packet.hex()}; received_bytes={len(packet)}; header_total_bytes={declared_length};" in caplog.text
+	jablotron._store_devices_data.assert_not_called()
+	stream.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_section_map_probe_preserves_existing_cache_even_when_complete(section_map_probe, complete):
+	jablotron, stream, _, _ = section_map_probe
+	previous_data = {
+		f"device_{number}": {
+			DeviceData.CONNECTION: DeviceConnection.WIRED,
+			DeviceData.SIGNAL_STRENGTH: None,
+			DeviceData.BATTERY: False,
+			DeviceData.BATTERY_LEVEL: None,
+			DeviceData.SECTION: section if complete else None,
+			DeviceData.MODEL: "JA-110P",
+		}
+		for number, section in ((200, 1), (214, 2), (219, 2))
+	}
+	jablotron._devices_data = {key: value.copy() for key, value in previous_data.items()}
+	with pytest.raises(ServiceUnavailable, match="capture finished"):
+		jablotron._detect_devices()
+	assert jablotron._devices_data == previous_data
+	jablotron._store_devices_data.assert_not_called()
+	jablotron._open_read_stream.assert_called_once()
+	stream.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("highest", [122, 123])
+def test_section_map_probe_gates_on_non_ignored_position_before_cache_check(discovery, highest):
+	jablotron, _ = discovery
+	jablotron._config[CONF_NUMBER_OF_DEVICES] = 230
+	jablotron._get_not_ignored_devices.return_value = [highest]
+	jablotron._devices_data = {
+		f"device_{highest}": {
+			DeviceData.CONNECTION: DeviceConnection.WIRED,
+			DeviceData.SIGNAL_STRENGTH: None,
+			DeviceData.BATTERY: False,
+			DeviceData.BATTERY_LEVEL: None,
+			DeviceData.SECTION: 1,
+		},
+	}
+	jablotron._probe_device_sections = Mock(side_effect=ServiceUnavailable("Synthetic probe completion"))
+	if highest == 123:
+		with pytest.raises(ServiceUnavailable, match="Synthetic probe completion"):
+			jablotron._detect_devices()
+		jablotron._probe_device_sections.assert_called_once_with(123)
+	else:
+		jablotron._detect_devices()
+		jablotron._probe_device_sections.assert_not_called()
+	jablotron._open_read_stream.assert_not_called()
+	jablotron._store_devices_data.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["open", "read", "read-timeout", "write", "eof", "unexpected-cancellation"])
+def test_section_map_probe_surfaces_io_errors_and_closes_reader(section_map_probe, caplog, failure):
+	jablotron, stream, _, _ = section_map_probe
+	if failure == "open":
+		jablotron._open_read_stream.side_effect = FileNotFoundError("Synthetic probe open failure")
+	elif failure == "write":
+		jablotron._send_packet.side_effect = OSError("Synthetic probe write failure")
+	else:
+		jablotron._open_read_stream.side_effect = None
+		jablotron._open_read_stream.return_value = stream
+		if failure == "read":
+			stream.read.side_effect = OSError("Synthetic probe read failure")
+		elif failure == "read-timeout":
+			stream.read.side_effect = TimeoutError("Synthetic probe read timeout")
+		else:
+			stream.read.side_effect = None
+			stream.read.return_value = b"" if failure == "eof" else None
+
+	with pytest.raises(ServiceUnavailable, match="Section-map probe v1 failed") as error:
+		jablotron._detect_devices()
+	assert isinstance(error.value.__cause__, (OSError, ServiceUnavailable))
+	assert "Section-map probe v1 failed" in caplog.text
+	assert "capture finished" not in caplog.text
+	assert len(jablotron._send_packet.call_args_list) <= 2
+	assert jablotron._devices_data == {"device_9": {DeviceData.SECTION: 4}}
+	jablotron._store_devices_data.assert_not_called()
+	if failure == "open":
+		stream.close.assert_not_called()
+	else:
+		stream.close.assert_called_once_with()
+	assert jablotron._open_read_stream.call_args.args[0].is_set()
+
+
+@pytest.mark.parametrize("stop_before_start", [False, True])
+def test_section_map_probe_cancellation_prevents_late_requests(section_map_probe, caplog, stop_before_start):
+	jablotron, stream, _, _ = section_map_probe
+	if stop_before_start:
+		jablotron._stream_stop_event.set()
+	else:
+		def send(packet):
+			if packet[:1] == PACKET_GET_DEVICES_SECTIONS:
+				jablotron._stream_stop_event.set()
+		jablotron._send_packet.side_effect = send
+
+	with pytest.raises(ServiceUnavailable, match="Section-map probe v1 stopped"):
+		jablotron._detect_devices()
+	assert "capture finished" not in caplog.text
+	assert jablotron._devices_data == {"device_9": {DeviceData.SECTION: 4}}
+	jablotron._store_devices_data.assert_not_called()
+	if stop_before_start:
+		jablotron._send_packet.assert_not_called()
+		jablotron._open_read_stream.assert_not_called()
+	else:
+		assert jablotron._send_packet.call_count == 2
+		stream.close.assert_called_once_with()
