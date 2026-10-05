@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import wait
 from queue import Empty, Queue
+import sys
 import threading
 from unittest.mock import Mock, call
 
@@ -463,7 +464,7 @@ def section_map_probe(discovery, monkeypatch):
 
 	jablotron._open_read_stream.side_effect = open_stream
 	waiter = Mock(side_effect=lambda futures, timeout: wait(futures, timeout=0.01))
-	monkeypatch.setattr("custom_components.jablotron100.jablotron.wait", waiter)
+	monkeypatch.setattr(sys.modules[Jablotron.__module__], "wait", waiter)
 	return jablotron, stream, enqueue, waiter
 
 
