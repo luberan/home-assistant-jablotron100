@@ -8,31 +8,33 @@ Tested with JA-100K, JA-101K, JA-101K-LAN, JA-103K, JA-103KRY, JA-106K-3G, JA-10
 
 ## Temporary diagnostic build: issue 174
 
-**Version `3.34.1.dev1741` is a capture-only build based on 3.34.1, not a fix or a production release.**
+**Version `3.34.1.dev1742` is the second capture-only build based on 3.34.1, not a fix or a production release.**
 It investigates [kukulich/home-assistant-jablotron100#174](https://github.com/kukulich/home-assistant-jablotron100/issues/174).
+
+The [physical v1 test](https://github.com/kukulich/home-assistant-jablotron100/issues/174#issuecomment-6004918883) strongly supports interpreting the two request parameters as **start and inclusive end**, rather than start and count: `(3, 4)` returned one data byte for two positions, not four. The unanswered high-position v1 requests had their second parameter below their start under this interpretation; they do not establish that high-position queries are unsupported. V2 tests ordered intervals instead. The high-position replies remain unverified on hardware.
 
 When the highest configured, non-ignored device position exceeds 122, startup runs a bounded section-map probe instead of normal device discovery. It does this even if the device cache is already complete, without clearing or updating that cache. **Setup deliberately ends with `ServiceUnavailable`; entities and automations depending on this integration will be unavailable during the test.** Do not leave this build installed. Configurations with no non-ignored positions above 122 follow the normal startup path.
 
 For the reported highest position 219, the probe sends the existing authorisation command followed by these seven `0x3a` read requests, once each:
 
-| Window | Raw parameter bytes, shown as decimal values | Request packet |
-| --- | --- | --- |
-| 1 | 1, 219 | `3a0201db` |
-| 2 | 1, 2 | `3a020102` |
-| 3 | 3, 4 | `3a020304` |
-| 4 | 123, 97 | `3a027b61` |
-| 5 | 199, 2 | `3a02c702` |
-| 6 | 213, 2 | `3a02d502` |
-| 7 | 219, 1 | `3a02db01` |
+| Window | Intended inclusive interval | Request packet | Expected reply bytes |
+| --- | --- | --- | --- |
+| 1 | 1-122 | `3a02017a` | 64 |
+| 2 | 3-6 | `3a020306` | 5 |
+| 3 | 121-124 | `3a02797c` | 5 |
+| 4 | 123-219 | `3a027bdb` | 52 |
+| 5 | 199-200 | `3a02c7c8` | 4 |
+| 6 | 213-214 | `3a02d5d6` | 4 |
+| 7 | 219-219 | `3a02dbdb` | 4 |
 
-The meaning of the second parameter is **not yet verified**. Window 3 helps distinguish a count from an end position; the later requests test the count hypothesis at higher offsets, including reference positions 200, 214 and 219. Replies are recorded, not interpreted as section assignments. The probe waits two seconds after each request, records all observed `0x3b` packets (including malformed ones), and reports reply counts even if no map arrives. Window labels describe timing, not proven request/reply correlation. There are no probe retries within a startup, no arm/disarm or PG commands, and no changes to panel configuration. Stopping Home Assistant interrupts the capture.
+Expected lengths assume the inclusive-end interpretation; actual replies are logged even when their length differs. Every interval is ordered, starts at an odd position and spans at most 122 positions so the expected reply fits in 64 bytes. Window 2 further checks the end-position interpretation, window 3 crosses the old 122-position boundary, and windows 4-7 target the missing map and known F-Link references. Replies are recorded, not interpreted as section assignments. The probe waits two seconds after each request, records all observed `0x3b` packets (including malformed ones), and reports reply counts even if no map arrives. Window labels describe timing, not proven request/reply correlation. There are no probe retries within a startup, no arm/disarm or PG commands, and no changes to panel configuration. Stopping Home Assistant interrupts the capture.
 
 ### One-off test and rollback
 
 1. Back up the currently installed `custom_components/jablotron100` directory outside `custom_components`. Keep the existing integration configuration and cache; do not remove/re-add the integration, renumber devices or mark occupied positions as Empty.
 2. Choose a short maintenance window in which Home Assistant alarm entities and related automations may be unavailable. Keep the alarm's normal keypad/application available.
 3. Download the diagnostic branch/source ZIP linked in the issue comment. Stop Home Assistant Core, replace only `custom_components/jablotron100` with that directory from the ZIP, and start Home Assistant Core again. Do not replace the rest of your configuration.
-4. Capture the startup log through **`Section-map probe v1 capture finished`**, normally about 15 seconds after the probe starts for position 219. The final setup error is intentional. An I/O error is reported as **`Section-map probe v1 failed`** instead. If neither marker appears, stop the test and share the available startup log rather than repeatedly restarting.
+4. Capture the startup log through **`Section-map probe v2 capture finished`**, normally about 15 seconds after the probe starts for position 219. Confirm that the log says **v2**, not v1. The final setup error is intentional. An I/O error is reported as **`Section-map probe v2 failed`** instead. If neither marker appears, stop the test and share the available startup log rather than repeatedly restarting.
 5. All probe messages are at warning level and include the exact map requests/replies. The default Home Assistant logging level is sufficient; no broad packet logging is required. Remove any custom logging filter that suppresses warnings from `custom_components.jablotron100` for the test. Review the log for access codes, serial numbers and other identifying information before sharing; no configuration/storage files or 3.33.5 packet logs are needed.
 6. Stop Home Assistant Core, restore the backed-up integration directory, and start Home Assistant Core. Alternatively, redownload a known-working regular version through HACS and restart. For the reporter, 3.33.5 is the confirmed working rollback; 3.34.1 only improves diagnostics and is not a fix for this issue. Confirm that the expected entities and automations work again, and restore your usual logging settings.
 

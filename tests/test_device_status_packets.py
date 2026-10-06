@@ -473,13 +473,13 @@ def test_section_map_probe_records_exact_requests_without_applying_replies(secti
 	jablotron._config[CONF_PASSWORD] = "12*4826"
 	previous_data = {"device_9": {DeviceData.SECTION: 4}}
 	expected_requests = [
-		"3a0201db", "3a020102", "3a020304", "3a027b61", "3a02c702", "3a02d502", "3a02db01",
+		"3a02017a", "3a020306", "3a02797c", "3a027bdb", "3a02c7c8", "3a02d5d6", "3a02dbdb",
 	]
-	# Only the first map is captured from upstream issue 174; offset replies are synthetic.
+	# Reuse the captured prefix map; all v2 request/reply pairings are synthetic.
 	replies = [
 		bytes.fromhex("3b3e0103000000000000000000002292222222222222222222220001110433333355550050004400000629222202000000007077a0aa00a000aa000000333323"),
-		bytes.fromhex("3b020103"),
 		bytes.fromhex("3b03030000"),
+		bytes.fromhex("3b03792322"),
 		Jablotron.create_packet(PACKET_DEVICES_SECTIONS, b"\x7b" + b"\x00" * 49),
 		bytes.fromhex("3b02c700"),
 		bytes.fromhex("3b02d510"),
@@ -499,6 +499,7 @@ def test_section_map_probe_records_exact_requests_without_applying_replies(secti
 		jablotron._detect_devices()
 
 	assert "not a successful discovery" in str(error.value)
+	assert all(message.startswith("Section-map probe v2") for message in caplog.messages)
 	assert jablotron._send_packet.call_args_list == [
 		call(authorisation), *(call(bytes.fromhex(packet)) for packet in expected_requests),
 	]
@@ -522,9 +523,14 @@ def test_section_map_probe_records_exact_requests_without_applying_replies(secti
 
 
 @pytest.mark.parametrize("highest,expected_requests", [
-	pytest.param(123, ["3a02017b", "3a020102", "3a020304", "3a027b01"], id="first-position-above-limit"),
-	pytest.param(200, ["3a0201c8", "3a020102", "3a020304", "3a027b4e", "3a02c702"], id="reference-position-200"),
-	pytest.param(214, ["3a0201d6", "3a020102", "3a020304", "3a027b5c", "3a02c702", "3a02d502"], id="reference-position-214"),
+	pytest.param(123, ["3a02017a", "3a020306", "3a02797b", "3a027b7b"], id="first-position-above-limit"),
+	pytest.param(124, ["3a02017a", "3a020306", "3a02797c", "3a027b7c"], id="complete-boundary-pair"),
+	pytest.param(199, ["3a02017a", "3a020306", "3a02797c", "3a027bc7"], id="before-reference-position-200"),
+	pytest.param(200, ["3a02017a", "3a020306", "3a02797c", "3a027bc8", "3a02c7c8"], id="reference-position-200"),
+	pytest.param(213, ["3a02017a", "3a020306", "3a02797c", "3a027bd5", "3a02c7c8"], id="before-reference-position-214"),
+	pytest.param(214, ["3a02017a", "3a020306", "3a02797c", "3a027bd6", "3a02c7c8", "3a02d5d6"], id="reference-position-214"),
+	pytest.param(218, ["3a02017a", "3a020306", "3a02797c", "3a027bda", "3a02c7c8", "3a02d5d6"], id="before-reference-position-219"),
+	pytest.param(230, ["3a02017a", "3a020306", "3a02797c", "3a027be6", "3a02c7c8", "3a02d5d6", "3a02dbdb"], id="maximum-configured-position"),
 ])
 def test_section_map_probe_bounds_requests_and_reports_no_replies(section_map_probe, caplog, highest, expected_requests):
 	jablotron, stream, _, waiter = section_map_probe
@@ -533,8 +539,10 @@ def test_section_map_probe_bounds_requests_and_reports_no_replies(section_map_pr
 		jablotron._detect_devices()
 	requests = [invocation.args[0] for invocation in jablotron._send_packet.call_args_list[1:]]
 	assert requests == [bytes.fromhex(packet) for packet in expected_requests]
-	assert all(1 <= packet[2] <= highest and 1 <= packet[3] <= highest for packet in requests)
-	assert all(packet[2] + packet[3] - 1 <= highest for packet in requests[3:])
+	assert all(1 <= packet[2] <= packet[3] <= highest for packet in requests)
+	assert all(packet[2] % 2 == 1 for packet in requests)
+	assert all(3 + (packet[3] - packet[2] + 2) // 2 <= 64 for packet in requests)
+	assert {position for packet in requests for position in range(packet[2], packet[3] + 1)} == set(range(1, highest + 1))
 	assert waiter.call_count == len(expected_requests)
 	assert str(dict.fromkeys(range(len(expected_requests) + 1), 0)) in caplog.text
 	assert "not a successful discovery" in caplog.text
@@ -550,7 +558,7 @@ def test_section_map_probe_bounds_requests_and_reports_no_replies(section_map_pr
 ])
 def test_section_map_probe_records_malformed_maps(section_map_probe, caplog, packet, declared_length):
 	jablotron, stream, enqueue, _ = section_map_probe
-	first_request = bytes.fromhex("3a0201db")
+	first_request = bytes.fromhex("3a02017a")
 	jablotron._send_packet.side_effect = lambda outgoing: enqueue(packet) if outgoing == first_request else None
 	with pytest.raises(ServiceUnavailable, match="capture finished"):
 		jablotron._detect_devices()
@@ -626,10 +634,10 @@ def test_section_map_probe_surfaces_io_errors_and_closes_reader(section_map_prob
 			stream.read.side_effect = None
 			stream.read.return_value = b"" if failure == "eof" else None
 
-	with pytest.raises(ServiceUnavailable, match="Section-map probe v1 failed") as error:
+	with pytest.raises(ServiceUnavailable, match="Section-map probe v2 failed") as error:
 		jablotron._detect_devices()
 	assert isinstance(error.value.__cause__, (OSError, ServiceUnavailable))
-	assert "Section-map probe v1 failed" in caplog.text
+	assert "Section-map probe v2 failed" in caplog.text
 	assert "capture finished" not in caplog.text
 	assert len(jablotron._send_packet.call_args_list) <= 2
 	assert jablotron._devices_data == {"device_9": {DeviceData.SECTION: 4}}
@@ -652,7 +660,7 @@ def test_section_map_probe_cancellation_prevents_late_requests(section_map_probe
 				jablotron._stream_stop_event.set()
 		jablotron._send_packet.side_effect = send
 
-	with pytest.raises(ServiceUnavailable, match="Section-map probe v1 stopped"):
+	with pytest.raises(ServiceUnavailable, match="Section-map probe v2 stopped"):
 		jablotron._detect_devices()
 	assert "capture finished" not in caplog.text
 	assert jablotron._devices_data == {"device_9": {DeviceData.SECTION: 4}}

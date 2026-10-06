@@ -935,24 +935,29 @@ class Jablotron:
 		self._store_devices_data()
 
 	def _probe_device_sections(self, highest_device_number: int) -> None:
-		# Parameter 2 may be a count or an end position; do not decode these replies.
-		probes = [(1, highest_device_number), (1, 2), (3, 4)]
+		# Test inclusive end positions with odd starts; keep replies uninterpreted.
+		probes = [
+			(1, SECTION_MAP_POSITIONS_PER_PACKET),
+			(3, 6),
+			(SECTION_MAP_POSITIONS_PER_PACKET - 1, min(SECTION_MAP_POSITIONS_PER_PACKET + 2, highest_device_number)),
+		]
 		probes.extend(
-			(start, min(SECTION_MAP_POSITIONS_PER_PACKET, highest_device_number - start + 1))
+			(start, min(start + SECTION_MAP_POSITIONS_PER_PACKET - 1, highest_device_number))
 			for start in range(SECTION_MAP_POSITIONS_PER_PACKET + 1, highest_device_number + 1, SECTION_MAP_POSITIONS_PER_PACKET)
 		)
 		probes.extend(
-			(start, count) for start, count in ((199, 2), (213, 2), (219, 1))
-			if start + count - 1 <= highest_device_number
+			(start, end) for start, end in ((199, 200), (213, 214), (219, 219))
+			if end <= highest_device_number
 		)
 		LOGGER.warning(
-			"Section-map probe v1: diagnostic build, not a fix. Highest requested position: %s."
+			"Section-map probe v2: diagnostic build, not a fix. Highest requested position: %s."
+			" Testing inclusive end positions; replies will not be applied."
 			" Capturing %s read-only map requests with %s-second observation windows."
 			" Device cache will not be changed, even if already complete; setup will deliberately remain unavailable.",
 			highest_device_number, len(probes), SECTION_MAP_PROBE_SECONDS,
 		)
 		if self._stream_stop_event.is_set():
-			message = "Section-map probe v1 stopped before capture."
+			message = "Section-map probe v2 stopped before capture."
 			LOGGER.warning(message)
 			raise ServiceUnavailable(message)
 
@@ -979,7 +984,7 @@ class Jablotron:
 						reply_counts[window] += 1
 						declared_length = self.bytes_to_int(packet[1:2]) + 2 if len(packet) >= 2 else None
 						LOGGER.warning(
-							"Section-map probe v1: reply observed in window %s; packet=%s;"
+							"Section-map probe v2: reply observed in window %s; packet=%s;"
 							" received_bytes=%s; header_total_bytes=%s; byte_2=%s."
 							" Window timing does not prove which request a reply belongs to.",
 							window, packet.hex(), len(packet), declared_length, packet[2:3].hex(),
@@ -992,17 +997,17 @@ class Jablotron:
 				reader = executor.submit(reader_thread)
 				try:
 					self._send_packet(self.create_packet_authorisation_code(self._config[CONF_PASSWORD]))
-					for index, (first, second) in enumerate(probes, 1):
+					for index, (start, end) in enumerate(probes, 1):
 						if self._stream_stop_event.is_set():
 							break
 						if reader.done():
 							reader.result()
 							break
 						current_window = index
-						packet = self.create_packet(PACKET_GET_DEVICES_SECTIONS, self.int_to_bytes(first) + self.int_to_bytes(second))
+						packet = self.create_packet(PACKET_GET_DEVICES_SECTIONS, self.int_to_bytes(start) + self.int_to_bytes(end))
 						LOGGER.warning(
-							"Section-map probe v1: request window %s/%s; parameters=(%s, %s); packet=%s.",
-							index, len(probes), first, second, packet.hex(),
+							"Section-map probe v2: request window %s/%s; parameters=(%s, %s); packet=%s.",
+							index, len(probes), start, end, packet.hex(),
 						)
 						self._send_packet(packet)
 						done, _ = wait((reader,), timeout=SECTION_MAP_PROBE_SECONDS)
@@ -1013,19 +1018,19 @@ class Jablotron:
 					stop_event.set()
 			reader.result()
 		except (OSError, ServiceUnavailable) as ex:
-			message = "Section-map probe v1 failed: {}".format(ex)
+			message = "Section-map probe v2 failed: {}".format(ex)
 			LOGGER.exception("%s", message)
 			raise ServiceUnavailable(message) from ex
 
 		LOGGER.warning(
-			"Section-map probe v1: map reply counts by observation window (0 is before the first request): %s.",
+			"Section-map probe v2: map reply counts by observation window (0 is before the first request): %s.",
 			dict(enumerate(reply_counts)),
 		)
 		if self._stream_stop_event.is_set():
-			message = "Section-map probe v1 stopped during capture; no device cache was changed."
+			message = "Section-map probe v2 stopped during capture; no device cache was changed."
 		else:
 			message = (
-				"Section-map probe v1 capture finished. This is not a successful discovery."
+				"Section-map probe v2 capture finished. This is not a successful discovery."
 				" No section assignments or device cache were changed."
 				" Share the sanitized probe log and restore the regular integration build."
 			)
