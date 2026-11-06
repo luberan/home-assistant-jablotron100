@@ -9,6 +9,7 @@ from homeassistant.config_entries import ConfigEntries, ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry, entity_registry, frame
 from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.entity_platform import EntityPlatform
 import pytest
 import pytest_asyncio
 
@@ -30,6 +31,7 @@ async def hass(tmp_path):
 		loader.async_setup(instance)
 		frame.async_setup(instance)
 		instance.config_entries = ConfigEntries(instance, {})
+		await instance.config_entries.async_initialize()
 		instance.data[device_registry.DATA_REGISTRY] = device_registry.DeviceRegistry(instance)
 		await device_registry.async_load(instance)
 		await entity_registry.async_load(instance)
@@ -55,6 +57,25 @@ def entity_component(hass):
 		return component
 
 	return create_component
+
+
+@pytest.fixture
+def entity_platform():
+	def create_platform(component, entry):
+		platform = EntityPlatform(
+			hass=component.hass,
+			logger=component.logger,
+			domain=component.domain,
+			platform_name=entry.domain,
+			platform=None,
+			scan_interval=component.scan_interval,
+			entity_namespace=None,
+		)
+		platform.async_prepare()
+		platform.config_entry = entry
+		return platform
+
+	return create_platform
 
 
 @pytest.fixture(autouse=True)

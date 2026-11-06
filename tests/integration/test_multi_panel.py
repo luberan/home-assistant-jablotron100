@@ -57,7 +57,7 @@ def panels(hass):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reverse_order", [False, True])
 @pytest.mark.parametrize("unload_first", [False, True])
-async def test_reset_problem_targets_own_panel(hass, panels, reverse_order, unload_first):
+async def test_reset_problem_targets_own_panel(hass, panels, entity_platform, reverse_order, unload_first):
 	component = EntityComponent(logging.getLogger(__name__), "binary_sensor", hass)
 	platforms = []
 	loaded = list(reversed(panels)) if reverse_order else panels
@@ -66,8 +66,7 @@ async def test_reset_problem_targets_own_panel(hass, panels, reverse_order, unlo
 			for entity_type, control_id in ((EntityType.PROBLEM, "problem"), (EntityType.DEVICE_STATE_MOTION, "motion")):
 				instance.entities[entity_type][control_id] = JablotronControl(instance.central_unit(), None, control_id)
 				instance.entities_states[control_id] = STATE_ON
-			platform = component._async_init_entity_platform(DOMAIN, None)
-			platform.config_entry = entry
+			platform = entity_platform(component, entry)
 			platforms.append(platform)
 			entities = []
 			with patch.object(binary_sensor, "async_get_current_platform", return_value=platform):
@@ -287,13 +286,12 @@ async def test_startup_removes_only_obsolete_pg_outputs(hass, panels, output_cou
 
 
 @pytest.mark.asyncio
-async def test_pg_reduction_removes_loaded_entity(hass, panels):
+async def test_pg_reduction_removes_loaded_entity(hass, panels, entity_platform):
 	entry, instance = panels[0]
 	instance._config[CONF_NUMBER_OF_PG_OUTPUTS] = 2
 	await instance._create_pg_outputs()
 	component = EntityComponent(logging.getLogger(__name__), "switch", hass)
-	platform = component._async_init_entity_platform(DOMAIN, None)
-	platform.config_entry = entry
+	platform = entity_platform(component, entry)
 	entities = [JablotronProgrammableOutputEntity(instance, control) for control in instance.entities[EntityType.PROGRAMMABLE_OUTPUT].values()]
 	try:
 		await platform.async_add_entities(entities)
@@ -480,7 +478,7 @@ async def test_reduced_device_range_cleans_only_own_panel(hass, panels, device_c
 
 
 @pytest.mark.asyncio
-async def test_device_reduction_removes_loaded_entities(hass, panels):
+async def test_device_reduction_removes_loaded_entities(hass, panels, entity_platform):
 	entry, instance = panels[0]
 	instance._config[CONF_NUMBER_OF_DEVICES] = 50
 	instance._config[CONF_DEVICES] = [DeviceType.MOTION_DETECTOR] + [DeviceType.EMPTY] * 48 + [DeviceType.MOTION_DETECTOR]
@@ -498,8 +496,7 @@ async def test_device_reduction_removes_loaded_entities(hass, panels):
 	)
 	await instance._create_devices()
 	component = EntityComponent(logging.getLogger(__name__), "binary_sensor", hass)
-	platform = component._async_init_entity_platform(DOMAIN, None)
-	platform.config_entry = entry
+	platform = entity_platform(component, entry)
 	entities = [
 		binary_sensor.JablotronBinarySensor(instance, instance.entities[EntityType.PROBLEM][instance._get_device_problem_sensor_id(number)], binary_sensor.BINARY_SENSOR_TYPES[EntityType.PROBLEM])
 		for number in (1, 50)
